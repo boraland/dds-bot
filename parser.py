@@ -1,18 +1,26 @@
 """
 Парсер выписок: Сбербанк, Т-Банк, Модульбанк, ВТБ
+Без pandas — только стандартная библиотека + openpyxl
 """
 import csv
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
-import pandas as pd
+import openpyxl
 
 Transaction = Dict[str, Any]
 
 def parse_csv(file_path: str) -> Tuple[List[Transaction], str]:
     if file_path.endswith(".xlsx") or file_path.endswith(".xls"):
         return parse_excel(file_path)
-    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
-        header = f.read(2000)
+
+    for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+        try:
+            with open(file_path, "r", encoding=enc, errors="replace") as f:
+                header = f.read(2000)
+            break
+        except Exception:
+            header = ""
+
     if "Сбербанк" in header or "Сбер" in header:
         return parse_sber(file_path), "Сбербанк"
     elif "Тинькофф" in header or "Т-Банк" in header or "TINKOFF" in header.upper():
@@ -25,84 +33,111 @@ def parse_csv(file_path: str) -> Tuple[List[Transaction], str]:
         return parse_generic(file_path), "Неизвестный банк"
 
 def parse_excel(file_path: str) -> Tuple[List[Transaction], str]:
-    df = pd.read_excel(file_path, header=None)
-    header_row = 0
-    for i, row in df.iterrows():
-        row_str = " ".join(str(v) for v in row.values)
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+
+    # Найти строку заголовков
+    header_idx = 0
+    for i, row in enumerate(rows):
+        row_str = " ".join(str(v) for v in row if v)
         if any(w in row_str for w in ["Дата", "Сумма", "Назначение"]):
-            header_row = i
+            header_idx = i
             break
-    df.columns = df.iloc[header_row]
-    df = df.iloc[header_row + 1:].reset_index(drop=True)
-    top_text = " ".join(str(v) for v in df.head(3).values.flatten())
+
+    headers = [str(h).strip() if h else f"col{i}" for i, h in enumerate(rows[header_idx])]
+    transactions = []
+    for row in rows[header_idx + 1:]:
+        row_dict = {headers[i]: str(v).strip() if v is not None else "" for i, v in enumerate(row)}
+        result = parse_generic_rows([row_dict])
+        transactions.extend(result)
+
+    top_text = " ".join(str(v) for v in rows[:3] if v)
     bank = "ВТБ" if "ВТБ" in top_text else "Сбербанк"
-    return parse_generic_df(df), bank
+    return transactions, bank
 
 def parse_sber(file_path: str) -> List[Transaction]:
     transactions = []
-    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
-        lines = f.readlines()
+    for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+        try:
+            with open(file_path, "r", encoding=enc, errors="replace") as f:
+                lines = f.readlines()
+            break
+        except Exception:
+            continue
+
     header_idx = next((i for i, l in enumerate(lines) if "Дата" in l and "Сумма" in l), 0)
     reader = csv.DictReader(lines[header_idx:], delimiter=";")
     for row in reader:
         try:
             date_str = row.get("Дата операции", row.get("Дата", ""))
-            debit = row.get("Дебет", row.get("Сумма списания", "")).replace(" ", "").replace(",", ".")
-            credit = row.get("Кредит", row.get("Сумма пополнения", "")).replace(" ", "").replace(",", ".")
+            debit = clean_num(row.get("Дебет", row.get("Сумма списания", "")))
+            credit = clean_num(row.get("Кредит", row.get("Сумма пополнения", "")))
             description = row.get("Назначение платежа", row.get("Информация", ""))
-            if debit and float(debit or 0):
-                amount = -abs(float(debit))
-            elif credit and float(credit or 0):
-                amount = abs(float(credit))
+            if debit:
+                amount = -abs(debit)
+            elif credit:
+                amount = abs(credit)
             else:
                 continue
             date = parse_date(date_str)
             if date:
-                transactions.append({"date": date, "amount": amount, "description": description.strip(), "category": "", "type": "income" if amount > 0 else "expense"})
+                transactions.append(make_txn(date, amount, description))
         except Exception:
             continue
     return transactions
 
 def parse_tbank(file_path: str) -> List[Transaction]:
     transactions = []
-    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
-        lines = f.readlines()
+    for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+        try:
+            with open(file_path, "r", encoding=enc, errors="replace") as f:
+                lines = f.readlines()
+            break
+        except Exception:
+            continue
+
     header_idx = next((i for i, l in enumerate(lines) if "Дата" in l and ("Сумма" in l or "Описание" in l)), 0)
     reader = csv.DictReader(lines[header_idx:], delimiter=";")
     for row in reader:
         try:
             date_str = row.get("Дата операции", row.get("Дата платежа", ""))
-            amount_str = row.get("Сумма операции", row.get("Сумма", "0")).replace(" ", "").replace(",", ".")
+            amount = clean_num(row.get("Сумма операции", row.get("Сумма", "0"))) or 0
             description = row.get("Описание", row.get("Категория", ""))
-            amount = float(amount_str)
             date = parse_date(date_str)
             if date:
-                transactions.append({"date": date, "amount": amount, "description": description.strip(), "category": "", "type": "income" if amount > 0 else "expense"})
+                transactions.append(make_txn(date, amount, description))
         except Exception:
             continue
     return transactions
 
 def parse_modulbank(file_path: str) -> List[Transaction]:
     transactions = []
-    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
-        lines = f.readlines()
+    for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+        try:
+            with open(file_path, "r", encoding=enc, errors="replace") as f:
+                lines = f.readlines()
+            break
+        except Exception:
+            continue
+
     header_idx = next((i for i, l in enumerate(lines) if "Дата" in l and ("Дебет" in l or "Кредит" in l)), 0)
     reader = csv.DictReader(lines[header_idx:], delimiter=";")
     for row in reader:
         try:
             date_str = row.get("Дата", "")
-            debit = row.get("Дебет", "").replace(" ", "").replace(",", ".")
-            credit = row.get("Кредит", "").replace(" ", "").replace(",", ".")
+            debit = clean_num(row.get("Дебет", ""))
+            credit = clean_num(row.get("Кредит", ""))
             description = row.get("Назначение платежа", row.get("Контрагент", ""))
-            if debit and float(debit or 0):
-                amount = -abs(float(debit))
-            elif credit and float(credit or 0):
-                amount = abs(float(credit))
+            if debit:
+                amount = -abs(debit)
+            elif credit:
+                amount = abs(credit)
             else:
                 continue
             date = parse_date(date_str)
             if date:
-                transactions.append({"date": date, "amount": amount, "description": description.strip(), "category": "", "type": "income" if amount > 0 else "expense"})
+                transactions.append(make_txn(date, amount, description))
         except Exception:
             continue
     return transactions
@@ -135,20 +170,28 @@ def parse_generic_rows(rows: list) -> List[Transaction]:
             continue
         try:
             date = parse_date(row.get(date_key, ""))
-            amount = float(row.get(sum_key, "0").replace(" ", "").replace(",", "."))
+            amount = clean_num(row.get(sum_key, "0")) or 0
             description = row.get(desc_key, "") if desc_key else ""
             if date:
-                transactions.append({"date": date, "amount": amount, "description": description.strip(), "category": "", "type": "income" if amount > 0 else "expense"})
+                transactions.append(make_txn(date, amount, description))
         except Exception:
             continue
     return transactions
 
-def parse_generic_df(df) -> List[Transaction]:
-    transactions = []
-    for _, row in df.iterrows():
-        row_dict = {str(k): str(v) for k, v in row.items() if str(v) != 'nan'}
-        transactions.extend(parse_generic_rows([row_dict]))
-    return transactions
+def make_txn(date, amount, description):
+    return {
+        "date": date,
+        "amount": amount,
+        "description": str(description).strip(),
+        "category": "",
+        "type": "income" if amount > 0 else "expense",
+    }
+
+def clean_num(s: str) -> float:
+    try:
+        return float(str(s).replace(" ", "").replace(",", ".").replace("\xa0", ""))
+    except Exception:
+        return 0.0
 
 def parse_date(date_str: str):
     date_str = str(date_str).strip()
