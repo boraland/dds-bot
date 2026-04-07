@@ -5,7 +5,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-from parsers import parse_csv
+from parser import parse_csv
 from report import generate_dds_report
 
 logging.basicConfig(
@@ -66,7 +66,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await file.download_as_bytearray()
     csv_content = file_bytes.decode("utf-8-sig", errors="replace")
 
-    result = parse_csv(csv_content, doc.file_name)
+    result = _csv(csv_content, doc.file_name)
 
     if result["status"] == "error":
         await update.message.reply_text(
